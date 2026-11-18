@@ -6,6 +6,8 @@
 //! inner bytes, the proxy relays the two sockets using Linux splice.
 
 mod proxy;
+mod ring_io;
+mod ring_proxy;
 mod tls;
 mod transparent;
 mod tunnel;
@@ -18,6 +20,28 @@ pub use proxy::{serve_listener, Endpoint};
 pub use transparent::serve_transparent;
 pub use tunnel::{ReadOut, Tunnel};
 pub use udp::UdpTunnel;
+
+pub fn serve_daemon(
+    listener: std::net::TcpListener,
+    endpoint: Endpoint,
+    transparent: Option<(u16, bool)>,
+) -> Result<()> {
+    if let Some(result) = ring_proxy::try_serve(&listener, &endpoint, transparent)? {
+        return result;
+    }
+    if let Some((port, tproxy)) = transparent {
+        let socks = endpoint.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = proxy::serve_listener_blocking(listener, socks) {
+                eprintln!("reality SOCKS: {error}");
+                std::process::exit(1);
+            }
+        });
+        serve_transparent(port, tproxy, endpoint)
+    } else {
+        proxy::serve_listener_blocking(listener, endpoint)
+    }
+}
 
 pub const XRAY_VERSION: [u8; 3] = [26, 11, 9];
 

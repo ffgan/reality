@@ -8,12 +8,14 @@ description = "VLESS REALITY client aligned with Xray 26.11.9, with io_uring spl
 license = "MIT"
 
 [dependencies]
-aes-gcm = "0.10"
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc"] }
 base64 = "0.22"
 ed25519-dalek = "2"
+flume = { version = "0.11", default-features = false, features = ["async"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.2"
 hmac = "0.12"
-io-uring = "0.7"
+io-uring = "0.6"
 libc = "0.2"
 ml-kem = "0.2.2"
 rand = "0.8"
@@ -22,6 +24,7 @@ serde_json = "1"
 socket2 = { version = "0.6", features = ["all"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 x509-parser = "0.16"
+monoio = { version = "0.2.4", default-features = false, features = ["iouring", "async-cancel", "sync"] }
 
 [dev-dependencies]
 base64 = "0.22"

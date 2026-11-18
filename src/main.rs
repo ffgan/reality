@@ -2,9 +2,7 @@ use std::env;
 use std::net::TcpListener;
 use std::process::ExitCode;
 
-use reality::{
-    parse_key, parse_short_id, parse_uuid, serve_listener, serve_transparent, Config, Endpoint,
-};
+use reality::{parse_key, parse_short_id, parse_uuid, serve_daemon, Config, Endpoint};
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -91,21 +89,8 @@ fn main() -> ExitCode {
         },
         uuid: id,
     };
-    if let Some(port) = redirect {
-        let socks = endpoint.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = serve_listener(ln, socks) {
-                eprintln!("reality SOCKS: {e}");
-                std::process::exit(1);
-            }
-        });
-        if let Err(e) = serve_transparent(port, tproxy, endpoint) {
-            return fatal(e);
-        }
-        return ExitCode::SUCCESS;
-    }
-    if let Err(e) = serve_listener(ln, endpoint) {
-        return fatal(e);
+    if let Err(error) = serve_daemon(ln, endpoint, redirect.map(|port| (port, tproxy))) {
+        return fatal(error);
     }
     ExitCode::SUCCESS
 }

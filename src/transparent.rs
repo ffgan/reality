@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{sync_channel, SyncSender},
@@ -14,7 +14,7 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-const MAX_SESSIONS: usize = 64;
+pub(crate) const MAX_SESSIONS: usize = 64;
 
 fn set_int(fd: RawFd, level: i32, option: i32, value: i32) -> io::Result<()> {
     let rc = unsafe {
@@ -33,7 +33,7 @@ fn set_int(fd: RawFd, level: i32, option: i32, value: i32) -> io::Result<()> {
     }
 }
 
-fn socket(ipv6: bool, udp: bool) -> io::Result<Socket> {
+pub(crate) fn socket(ipv6: bool, udp: bool) -> io::Result<Socket> {
     let socket = Socket::new(
         if ipv6 { Domain::IPV6 } else { Domain::IPV4 },
         if udp { Type::DGRAM } else { Type::STREAM },
@@ -51,8 +51,20 @@ fn socket(ipv6: bool, udp: bool) -> io::Result<Socket> {
     Ok(socket)
 }
 
-fn bind(port: u16, ipv6: bool, udp: bool) -> io::Result<Socket> {
+pub(crate) fn bind(port: u16, ipv6: bool, udp: bool) -> io::Result<Socket> {
+    bind_listener(port, ipv6, udp, false)
+}
+
+pub(crate) fn bind_listener(
+    port: u16,
+    ipv6: bool,
+    udp: bool,
+    reuse_port: bool,
+) -> io::Result<Socket> {
     let socket = socket(ipv6, udp)?;
+    if reuse_port {
+        socket.set_reuse_port(true)?;
+    }
     if udp {
         set_int(
             socket.as_raw_fd(),
@@ -127,19 +139,23 @@ pub fn serve_transparent(port: u16, tproxy: bool, endpoint: Endpoint) -> Result<
     udp(udp4, endpoint)
 }
 
-fn tcp(local: TcpStream, tproxy: bool, endpoint: &Endpoint) -> Result<()> {
-    let dest = if tproxy {
-        local.local_addr()?
+pub(crate) fn tcp_destination(local: &impl AsFd, tproxy: bool) -> Result<SocketAddr> {
+    let sock = SockRef::from(local);
+    let address = sock.local_addr()?;
+    let destination = if tproxy {
+        address
+    } else if address.as_socket().is_some_and(|address| address.is_ipv6()) {
+        sock.original_dst_v6()?
     } else {
-        let sock = SockRef::from(&local);
-        let addr = if local.local_addr()?.is_ipv6() {
-            sock.original_dst_v6()?
-        } else {
-            sock.original_dst_v4()?
-        };
-        addr.as_socket()
-            .ok_or_else(|| err("missing original TCP destination"))?
+        sock.original_dst_v4()?
     };
+    destination
+        .as_socket()
+        .ok_or_else(|| err("missing original TCP destination"))
+}
+
+fn tcp(local: TcpStream, tproxy: bool, endpoint: &Endpoint) -> Result<()> {
+    let dest = tcp_destination(&local, tproxy)?;
     local.set_nodelay(true)?;
     let remote = Tunnel::dial(
         &endpoint.server,
@@ -160,7 +176,7 @@ fn udp(socket: UdpSocket, endpoint: Arc<Endpoint>) -> Result<()> {
     let mut sessions: HashMap<(SocketAddr, SocketAddr), Session> = HashMap::new();
     let mut packet = vec![0u8; 65535];
     loop {
-        let (len, source, dest) = recv_original(&socket, &mut packet)?;
+        let (len, source, dest) = recv_original(socket.as_raw_fd(), &mut packet)?;
         let key = (source, dest);
         sessions.retain(|_, session| session.alive.load(Ordering::Acquire));
         if !sessions.contains_key(&key) {
@@ -237,7 +253,10 @@ fn udp(socket: UdpSocket, endpoint: Arc<Endpoint>) -> Result<()> {
     }
 }
 
-fn recv_original(socket: &UdpSocket, packet: &mut [u8]) -> Result<(usize, SocketAddr, SocketAddr)> {
+pub(crate) fn recv_original(
+    fd: RawFd,
+    packet: &mut [u8],
+) -> Result<(usize, SocketAddr, SocketAddr)> {
     unsafe {
         let mut peer: libc::sockaddr_storage = zeroed();
         let mut control = [0usize; 64]; // aligned ancillary buffer
@@ -252,7 +271,7 @@ fn recv_original(socket: &UdpSocket, packet: &mut [u8]) -> Result<(usize, Socket
         msg.msg_iovlen = 1;
         msg.msg_control = control.as_mut_ptr() as _;
         msg.msg_controllen = size_of_val(&control) as _;
-        let n = libc::recvmsg(socket.as_raw_fd(), &mut msg, 0);
+        let n = libc::recvmsg(fd, &mut msg, 0);
         if n < 0 {
             return Err(io::Error::last_os_error().into());
         }

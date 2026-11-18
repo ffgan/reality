@@ -6,7 +6,7 @@
 
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -62,6 +62,19 @@ pub enum ReadOut {
     Splice,
 }
 
+pub(crate) fn upstream_socket(addr: SocketAddr) -> Result<Socket> {
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    // Set the bypass mark before connect: the SYN itself must escape the
+    // router's transparent proxy, otherwise the client loops into itself.
+    if let Ok(mark) = std::env::var("REALITY_OUTBOUND_MARK") {
+        let mark: u32 = mark
+            .parse()
+            .map_err(|_| err("invalid REALITY_OUTBOUND_MARK"))?;
+        socket.set_mark(mark)?;
+    }
+    Ok(socket)
+}
+
 impl Tunnel {
     pub fn dial_udp(
         server: &str,
@@ -86,15 +99,7 @@ impl Tunnel {
             .to_socket_addrs()?
             .next()
             .ok_or_else(|| err(format!("REALITY: cannot resolve {server}")))?;
-        let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-        // Set the bypass mark before connect: the SYN itself must escape the
-        // router's transparent proxy, otherwise the client loops into itself.
-        if let Ok(mark) = std::env::var("REALITY_OUTBOUND_MARK") {
-            let mark: u32 = mark
-                .parse()
-                .map_err(|_| err("invalid REALITY_OUTBOUND_MARK"))?;
-            socket.set_mark(mark)?;
-        }
+        let socket = upstream_socket(addr)?;
         socket.connect_timeout(&addr.into(), Duration::from_secs(10))?;
         let mut stream: TcpStream = socket.into();
         stream.set_nodelay(true)?;
@@ -175,11 +180,7 @@ impl Tunnel {
                 };
                 drop(keys);
                 let mut st = self.state.lock().expect("state");
-                let unpadded = st.unpad(&plain);
-                if st.filter_left > 0 && !unpadded.is_empty() {
-                    st.filter(&unpadded);
-                }
-                st.pending.extend(unpadded);
+                st.receive_payload(&plain);
             }
         }
     }
@@ -189,12 +190,7 @@ impl Tunnel {
             return self.write_chunk(&[]);
         }
         while !data.is_empty() {
-            let n = if data.len() <= BUF_SIZE || (data.len() <= 0xffff && is_complete_record(data))
-            {
-                data.len()
-            } else {
-                BUF_SIZE.min(data.len())
-            };
+            let n = chunk_len(data);
             self.write_chunk(&data[..n])?;
             data = &data[n..];
         }
@@ -240,32 +236,7 @@ impl Tunnel {
 
     fn write_chunk(&self, data: &[u8]) -> Result<()> {
         let _sending = self.sending.lock().expect("sending");
-        let (packet, raw) = {
-            let mut st = self.state.lock().expect("state");
-            let raw = if st.direct_armed {
-                st.direct_armed = false;
-                st.raw_write = true;
-                true
-            } else {
-                st.raw_write
-            };
-            if st.filter_left > 0 && !data.is_empty() {
-                st.filter(data);
-            }
-            let frame = st.pad(data);
-            let first = !st.header_sent;
-            if first {
-                st.header_sent = true;
-            }
-            let packet = if first {
-                let mut p = st.request.clone();
-                p.extend_from_slice(&frame);
-                p
-            } else {
-                frame
-            };
-            (packet, raw)
-        };
+        let (packet, raw) = self.state.lock().expect("state").outbound(data);
         if raw {
             let mut w = self.write.lock().expect("write");
             w.write_all(&packet)?;
@@ -313,21 +284,155 @@ impl Tunnel {
             };
             drop(keys);
             let mut st = self.state.lock().expect("state");
-            st.pending.extend(plain);
-            match take_response(&st.pending) {
-                Resp::NeedMore => continue,
-                Resp::Bad => return Err(err("REALITY: bad vless response")),
-                Resp::Done(rest) => {
-                    let unpadded = st.unpad(&rest);
-                    if st.filter_left > 0 && !unpadded.is_empty() {
-                        st.filter(&unpadded);
+            st.receive_response(plain)?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) mod ring {
+    use super::*;
+    use crate::ring_io::{clone_stream, handshake_upstream, RingTransport};
+    use crate::tls::Transport;
+    use monoio::net::TcpStream;
+    use std::cell::RefCell;
+    use std::os::fd::{AsRawFd, RawFd};
+    use std::rc::Rc;
+
+    pub(crate) struct Reader {
+        pub(crate) fd: RawFd,
+        stream: RingTransport<TcpStream>,
+        keys: Traffic,
+        state: Rc<RefCell<State>>,
+    }
+
+    pub(crate) struct Writer {
+        pub(crate) fd: RawFd,
+        stream: RingTransport<TcpStream>,
+        keys: Traffic,
+        state: Rc<RefCell<State>>,
+    }
+
+    pub(crate) async fn dial(
+        address: SocketAddr,
+        config: &Config,
+        uuid: [u8; 16],
+        host: &str,
+        port: u16,
+        udp: bool,
+    ) -> Result<(Reader, Writer)> {
+        let (stream, session) = handshake_upstream(address, config).await?;
+        let output = clone_stream(&stream)?;
+        let mut state = State::new(uuid, host, port);
+        if udp {
+            state.request = encode_request_for(&uuid, host, port, 2, "");
+            state.is_padding = false;
+            state.within = false;
+            state.filter_left = 0;
+        }
+        let state = Rc::new(RefCell::new(state));
+        Ok((
+            Reader {
+                fd: stream.as_raw_fd(),
+                stream: RingTransport::new(stream),
+                keys: session.read,
+                state: state.clone(),
+            },
+            Writer {
+                fd: output.as_raw_fd(),
+                stream: RingTransport::new(output),
+                keys: session.write,
+                state,
+            },
+        ))
+    }
+
+    pub(crate) enum Packet {
+        Data(Vec<u8>),
+        Eof,
+        Splice,
+    }
+
+    impl Reader {
+        pub(crate) fn stream(&self) -> &TcpStream {
+            self.stream.get_ref()
+        }
+
+        pub(crate) async fn read(&mut self) -> Result<Packet> {
+            loop {
+                {
+                    let mut state = self.state.borrow_mut();
+                    if state.response_done && !state.pending.is_empty() {
+                        return Ok(Packet::Data(std::mem::take(&mut state.pending)));
                     }
-                    st.pending = unpadded;
-                    st.response_done = true;
+                    if state.direct_read {
+                        return Ok(Packet::Splice);
+                    }
+                }
+                // Once the peer ends framing without entering direct mode,
+                // no subsequent bytes can become splice input.
+                if !self.state.borrow().within {
+                    self.stream.enable_read_ahead();
+                }
+                let plaintext = tls::read_app_async(&mut self.stream, &mut self.keys).await?;
+                let mut state = self.state.borrow_mut();
+                match plaintext {
+                    Some(data)
+                        if state.response_done && !state.within && state.filter_left <= 0 =>
+                    {
+                        state.pending = data;
+                    }
+                    Some(data) if state.response_done => state.receive_payload(&data),
+                    Some(data) => state.receive_response(data)?,
+                    None if state.response_done => return Ok(Packet::Eof),
+                    None => return Err(err("REALITY: eof before response")),
                 }
             }
         }
-        Ok(())
+    }
+
+    impl Writer {
+        pub(crate) fn stream(&self) -> &TcpStream {
+            self.stream.get_ref()
+        }
+
+        pub(crate) fn assembling_vision_record(&self) -> bool {
+            let state = self.state.borrow();
+            state.is_tls && state.is_padding
+        }
+
+        pub(crate) fn ready_to_splice(&self) -> bool {
+            let state = self.state.borrow();
+            state.direct_armed || state.raw_write
+        }
+
+        pub(crate) async fn write(&mut self, data: &[u8]) -> Result<()> {
+            let mut remaining = data;
+            loop {
+                let encrypted_unframed = {
+                    let state = self.state.borrow();
+                    state.header_sent
+                        && !state.is_padding
+                        && !state.direct_armed
+                        && !state.raw_write
+                        && state.filter_left <= 0
+                };
+                if encrypted_unframed {
+                    return tls::write_app_async(&mut self.stream, &mut self.keys, remaining).await;
+                }
+                let len = chunk_len(remaining);
+                let (packet, raw) = self.state.borrow_mut().outbound(&remaining[..len]);
+                if raw {
+                    self.stream.write_all(&packet).await?;
+                } else {
+                    tls::write_app_async(&mut self.stream, &mut self.keys, &packet).await?;
+                }
+                remaining = &remaining[len..];
+                if remaining.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
     }
 }
 
@@ -415,6 +520,54 @@ impl State {
         }
     }
 
+    fn outbound(&mut self, data: &[u8]) -> (Vec<u8>, bool) {
+        let raw = if self.direct_armed {
+            self.direct_armed = false;
+            self.raw_write = true;
+            true
+        } else {
+            self.raw_write
+        };
+        if self.filter_left > 0 && !data.is_empty() {
+            self.filter(data);
+        }
+        let frame = self.pad(data);
+        let first = !self.header_sent;
+        if first {
+            self.header_sent = true;
+        }
+        let packet = if first {
+            let mut p = self.request.clone();
+            p.extend_from_slice(&frame);
+            p
+        } else {
+            frame
+        };
+        (packet, raw)
+    }
+
+    fn receive_response(&mut self, plaintext: Vec<u8>) -> Result<()> {
+        self.pending.extend(plaintext);
+        match take_response(&self.pending) {
+            Resp::NeedMore => {}
+            Resp::Bad => return Err(err("REALITY: bad vless response")),
+            Resp::Done(rest) => {
+                self.pending.clear();
+                self.receive_payload(&rest);
+                self.response_done = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn receive_payload(&mut self, plaintext: &[u8]) {
+        let unpadded = self.unpad(plaintext);
+        if self.filter_left > 0 && !unpadded.is_empty() {
+            self.filter(&unpadded);
+        }
+        self.pending.extend(unpadded);
+    }
+
     fn pad(&mut self, content: &[u8]) -> Vec<u8> {
         if !self.is_padding {
             return content.to_vec();
@@ -471,7 +624,9 @@ impl State {
             c
         };
         let mut out = Vec::new();
-        while !b.is_empty() {
+        // A zero-padding frame can end exactly with the previous outer TLS
+        // record. Commit its command before the caller reads the next record.
+        while !b.is_empty() || (self.rem_cmd == 0 && self.rem_content == 0 && self.rem_pad == 0) {
             if self.rem_cmd == -1 && self.rem_content == -1 && self.rem_pad == -1 {
                 if self.within && b.len() < 21 {
                     self.carry = b;
@@ -613,6 +768,14 @@ fn encode_addons(flow: &str) -> Vec<u8> {
     body
 }
 
+fn chunk_len(data: &[u8]) -> usize {
+    if data.len() <= BUF_SIZE || (data.len() <= 0xffff && is_complete_record(data)) {
+        data.len()
+    } else {
+        BUF_SIZE
+    }
+}
+
 fn is_complete_record(b: &[u8]) -> bool {
     if b.is_empty() {
         return false;
@@ -692,6 +855,19 @@ mod tests {
     }
 
     #[test]
+    fn zero_padding_direct_frame_switches_at_the_record_boundary() {
+        let uuid = [0x42; 16];
+        let mut reader = State::new(uuid, "example.com", 443);
+        let mut frame = uuid.to_vec();
+        frame.extend_from_slice(&[PAD_DIRECT, 0, 3, 0, 0]);
+        frame.extend_from_slice(b"abc");
+        assert_eq!(reader.unpad(&frame[..frame.len() - 1]), b"ab");
+        assert!(!reader.direct_read);
+        assert_eq!(reader.unpad(&frame[frame.len() - 1..]), b"c");
+        assert!(reader.direct_read);
+    }
+
+    #[test]
     fn unpad_one_byte_at_a_time() {
         let mut writer = State::new([0x11; 16], "example.com", 443);
         let frame = writer.pad(b"abcdefghij");
@@ -702,7 +878,7 @@ mod tests {
         }
         assert_eq!(got, b"abcdefghij");
         let second = writer.pad(b"more");
-        assert_ne!(&second[..16], &[0x11; 16]);
+        assert!(!second.starts_with(&[0x11; 16]));
         assert_eq!(reader.unpad(&second), b"more");
     }
 

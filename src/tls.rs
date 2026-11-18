@@ -5,10 +5,12 @@
 //! `random[:20]`, info `REALITY`. The TLS handshake secret is separate. When
 //! the peer selects X25519MLKEM768 it is ML-KEM-768 || X25519 (64 bytes).
 
+use std::future::Future;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::task::{Context, Poll, Waker};
 
-use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::aead::{Aead, AeadInOut, Payload};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
@@ -28,7 +30,7 @@ const MLKEM_EK: usize = 1184;
 const MLKEM_CT: usize = 1088;
 
 pub struct Traffic {
-    key: [u8; 16],
+    cipher: Aes128Gcm,
     iv: [u8; 12],
     seq: u64,
 }
@@ -38,7 +40,50 @@ pub struct Session {
     pub write: Traffic,
 }
 
+pub(crate) trait Transport {
+    async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()>;
+    async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()>;
+
+    async fn read_body(&mut self, len: usize) -> std::io::Result<Vec<u8>> {
+        let mut body = vec![0; len];
+        self.read_exact(&mut body).await?;
+        Ok(body)
+    }
+
+    async fn write_record(&mut self, record: Vec<u8>) -> std::io::Result<()> {
+        self.write_all(&record).await
+    }
+}
+
+pub(crate) struct BlockingTransport<'a>(pub(crate) &'a mut TcpStream);
+
+impl Transport for BlockingTransport<'_> {
+    async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        self.0.read_exact(buf)
+    }
+
+    async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.0.write_all(buf)
+    }
+}
+
+// Only used with BlockingTransport, whose operations finish in the first poll.
+pub(crate) fn run_blocking<T>(operation: impl Future<Output = Result<T>>) -> Result<T> {
+    let mut operation = std::pin::pin!(operation);
+    match operation
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    {
+        Poll::Ready(result) => result,
+        Poll::Pending => unreachable!("blocking TLS transport yielded"),
+    }
+}
+
 pub fn handshake(stream: &mut TcpStream, cfg: &Config) -> Result<Session> {
+    run_blocking(handshake_async(&mut BlockingTransport(stream), cfg))
+}
+
+pub(crate) async fn handshake_async(stream: &mut impl Transport, cfg: &Config) -> Result<Session> {
     let mut rng = OsRng;
     let x25519 = StaticSecret::random_from_rng(&mut rng);
     let xpub = PublicKey::from(&x25519);
@@ -69,9 +114,9 @@ pub fn handshake(stream: &mut TcpStream, cfg: &Config) -> Result<Session> {
     seal_session_id(&mut hello, &auth_key, &random, &cfg.short_id)?;
 
     let record = wrap_record(0x16, 0x0301, &hello);
-    stream.write_all(&record)?;
+    stream.write_record(record).await?;
 
-    let server_hello = read_handshake_message(stream)?;
+    let server_hello = read_handshake_message(stream).await?;
     if server_hello.first().copied() != Some(2) {
         return Err(err("REALITY: expected ServerHello"));
     }
@@ -102,7 +147,7 @@ pub fn handshake(stream: &mut TcpStream, cfg: &Config) -> Result<Session> {
     let mut saw_finished = false;
     while !saw_finished {
         let Some(msg) = take_message(&mut hs_buf) else {
-            let (typ, content) = read_inner(stream, &mut read_keys)?;
+            let (typ, content) = read_inner(stream, &mut read_keys).await?;
             if typ == 0x15 {
                 let desc = content.get(1).copied().unwrap_or(0);
                 return Err(err(format!("REALITY: alert {desc}")));
@@ -155,7 +200,7 @@ pub fn handshake(stream: &mut TcpStream, cfg: &Config) -> Result<Session> {
     put_u24(&mut fin, verify.len());
     fin.extend_from_slice(&verify);
     let record = seal_record(&mut write_keys, 0x16, &fin)?;
-    stream.write_all(&record)?;
+    stream.write_record(record).await?;
 
     Ok(Session {
         read: traffic_keys(&server_ap),
@@ -164,19 +209,40 @@ pub fn handshake(stream: &mut TcpStream, cfg: &Config) -> Result<Session> {
 }
 
 pub fn write_app(stream: &mut TcpStream, traffic: &mut Traffic, data: &[u8]) -> Result<()> {
-    let mut off = 0;
-    while off < data.len() {
-        let n = (data.len() - off).min(16 * 1024);
-        let record = seal_record(traffic, 0x17, &data[off..off + n])?;
-        stream.write_all(&record)?;
-        off += n;
+    run_blocking(write_app_async(
+        &mut BlockingTransport(stream),
+        traffic,
+        data,
+    ))
+}
+
+pub(crate) async fn write_app_async(
+    stream: &mut impl Transport,
+    traffic: &mut Traffic,
+    data: &[u8],
+) -> Result<()> {
+    const RECORD_PAYLOAD: usize = 16 * 1024;
+    for batch in data.chunks(4 * RECORD_PAYLOAD) {
+        let records = batch.len().div_ceil(RECORD_PAYLOAD);
+        let mut ciphertext = Vec::with_capacity(batch.len() + records * 22);
+        for payload in batch.chunks(RECORD_PAYLOAD) {
+            append_record(&mut ciphertext, traffic, 0x17, payload)?;
+        }
+        stream.write_record(ciphertext).await?;
     }
     Ok(())
 }
 
 pub fn read_app(stream: &mut TcpStream, traffic: &mut Traffic) -> Result<Option<Vec<u8>>> {
+    run_blocking(read_app_async(&mut BlockingTransport(stream), traffic))
+}
+
+pub(crate) async fn read_app_async(
+    stream: &mut impl Transport,
+    traffic: &mut Traffic,
+) -> Result<Option<Vec<u8>>> {
     loop {
-        let (typ, content) = read_inner(stream, traffic)?;
+        let (typ, content) = read_inner(stream, traffic).await?;
         match typ {
             0x17 => {
                 if content.is_empty() {
@@ -254,7 +320,7 @@ fn seal_session_id(
     let cipher = Aes256Gcm::new_from_slice(auth_key).map_err(|_| err("REALITY: bad auth key"))?;
     let ct = cipher
         .encrypt(
-            Nonce::from_slice(&random[20..]),
+            &Nonce::try_from(&random[20..]).expect("fixed nonce length"),
             Payload {
                 msg: &plain,
                 aad: hello,
@@ -471,19 +537,18 @@ fn wrap_record(typ: u8, version: u16, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-fn read_record(stream: &mut TcpStream) -> Result<(u8, [u8; 5], Vec<u8>)> {
+async fn read_record(stream: &mut impl Transport) -> Result<(u8, [u8; 5], Vec<u8>)> {
     let mut hdr = [0u8; 5];
-    stream.read_exact(&mut hdr)?;
+    stream.read_exact(&mut hdr).await?;
     let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
     if len > 18_432 {
         return Err(err("REALITY: record too large"));
     }
-    let mut body = vec![0u8; len];
-    stream.read_exact(&mut body)?;
+    let body = stream.read_body(len).await?;
     Ok((hdr[0], hdr, body))
 }
 
-fn read_handshake_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
+async fn read_handshake_message(stream: &mut impl Transport) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     loop {
         if buf.len() >= 4 {
@@ -495,7 +560,7 @@ fn read_handshake_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
                 return Ok(buf);
             }
         }
-        let (typ, _, body) = read_record(stream)?;
+        let (typ, _, body) = read_record(stream).await?;
         if typ == 0x15 {
             let desc = body.get(1).copied().unwrap_or(0);
             return Err(err(format!("REALITY: alert {desc}")));
@@ -507,9 +572,9 @@ fn read_handshake_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
     }
 }
 
-fn read_inner(stream: &mut TcpStream, traffic: &mut Traffic) -> Result<(u8, Vec<u8>)> {
+async fn read_inner(stream: &mut impl Transport, traffic: &mut Traffic) -> Result<(u8, Vec<u8>)> {
     loop {
-        let (typ, hdr, body) = read_record(stream)?;
+        let (typ, hdr, mut body) = read_record(stream).await?;
         if typ == 0x14 {
             continue;
         }
@@ -522,56 +587,52 @@ fn read_inner(stream: &mut TcpStream, traffic: &mut Traffic) -> Result<(u8, Vec<
                 "REALITY: expected application data, got {typ}"
             )));
         }
-        let cipher = Aes128Gcm::new_from_slice(&traffic.key).map_err(|_| err("key"))?;
         let nonce = nonce_for(&traffic.iv, traffic.seq);
-        let plain = cipher
-            .decrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &body,
-                    aad: &hdr,
-                },
-            )
+        traffic
+            .cipher
+            .decrypt_in_place(&Nonce::from(nonce), &hdr, &mut body)
             .map_err(|_| err("REALITY: decrypt failed"))?;
         traffic.seq += 1;
-        return Ok(split_inner(&plain)?);
+        return split_inner(body);
     }
 }
 
 fn seal_record(traffic: &mut Traffic, inner_type: u8, content: &[u8]) -> Result<Vec<u8>> {
-    let mut plain = Vec::with_capacity(content.len() + 1);
-    plain.extend_from_slice(content);
-    plain.push(inner_type);
-    let ct_len = (plain.len() + 16) as u16;
-    let hdr = [0x17, 0x03, 0x03, (ct_len >> 8) as u8, (ct_len & 0xff) as u8];
-    let cipher = Aes128Gcm::new_from_slice(&traffic.key).map_err(|_| err("key"))?;
-    let nonce = nonce_for(&traffic.iv, traffic.seq);
-    let ct = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: &plain,
-                aad: &hdr,
-            },
-        )
-        .map_err(|_| err("REALITY: encrypt failed"))?;
-    traffic.seq += 1;
-    let mut out = Vec::with_capacity(5 + ct.len());
-    out.extend_from_slice(&hdr);
-    out.extend_from_slice(&ct);
-    Ok(out)
+    let mut record = Vec::with_capacity(content.len() + 22);
+    append_record(&mut record, traffic, inner_type, content)?;
+    Ok(record)
 }
 
-fn split_inner(plain: &[u8]) -> Result<(u8, Vec<u8>)> {
-    let mut end = plain.len();
-    while end > 0 && plain[end - 1] == 0 {
-        end -= 1;
-    }
-    if end == 0 {
-        return Err(err("REALITY: empty inner plaintext"));
-    }
-    let typ = plain[end - 1];
-    Ok((typ, plain[..end - 1].to_vec()))
+fn append_record(
+    record: &mut Vec<u8>,
+    traffic: &mut Traffic,
+    kind: u8,
+    content: &[u8],
+) -> Result<()> {
+    let ct_len = (content.len() + 17) as u16;
+    let hdr = [0x17, 0x03, 0x03, (ct_len >> 8) as u8, ct_len as u8];
+    record.extend_from_slice(&hdr);
+    let start = record.len();
+    record.extend_from_slice(content);
+    record.push(kind);
+    let nonce = nonce_for(&traffic.iv, traffic.seq);
+    let tag = traffic
+        .cipher
+        .encrypt_inout_detached(&Nonce::from(nonce), &hdr, (&mut record[start..]).into())
+        .map_err(|_| err("REALITY: encrypt failed"))?;
+    traffic.seq += 1;
+    record.extend_from_slice(&tag);
+    Ok(())
+}
+
+fn split_inner(mut plaintext: Vec<u8>) -> Result<(u8, Vec<u8>)> {
+    let position = plaintext
+        .iter()
+        .rposition(|&byte| byte != 0)
+        .ok_or_else(|| err("REALITY: empty inner plaintext"))?;
+    let kind = plaintext[position];
+    plaintext.truncate(position);
+    Ok((kind, plaintext))
 }
 
 fn nonce_for(iv: &[u8; 12], seq: u64) -> [u8; 12] {
@@ -659,7 +720,7 @@ fn traffic_keys(secret: &[u8]) -> Traffic {
     k.copy_from_slice(&key);
     v.copy_from_slice(&iv);
     Traffic {
-        key: k,
+        cipher: Aes128Gcm::new((&k).into()),
         iv: v,
         seq: 0,
     }
@@ -711,6 +772,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn record_read_resumes_after_header_and_body_waits() {
+        struct PendingRead<'a>(&'a [u8]);
+
+        impl Transport for PendingRead<'_> {
+            async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+                let mut pending = true;
+                std::future::poll_fn(|cx| {
+                    if std::mem::take(&mut pending) {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(self.0.read_exact(buf))
+                    }
+                })
+                .await
+            }
+
+            async fn write_all(&mut self, _: &[u8]) -> std::io::Result<()> {
+                unreachable!("record reader does not write")
+            }
+        }
+
+        let record = wrap_record(0x16, 0x0303, b"hello");
+        let mut transport = PendingRead(&record);
+        let mut read = std::pin::pin!(read_record(&mut transport));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(read.as_mut().poll(&mut cx).is_pending());
+        assert!(read.as_mut().poll(&mut cx).is_pending());
+        let Poll::Ready(Ok((kind, _, body))) = read.as_mut().poll(&mut cx) else {
+            panic!("record did not finish");
+        };
+        assert_eq!(kind, 0x16);
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
     fn hello_carries_hybrid_share() {
         let random = [7u8; 32];
         let ek = vec![1u8; MLKEM_EK];
@@ -729,7 +826,7 @@ mod tests {
         aad[39..71].fill(0);
         let opened = cipher
             .decrypt(
-                Nonce::from_slice(&random[20..]),
+                &Nonce::try_from(&random[20..]).expect("fixed nonce length"),
                 Payload {
                     msg: &sealed[39..71],
                     aad: &aad,
