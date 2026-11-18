@@ -27,6 +27,7 @@ x509-parser = "0.16"
 monoio = { version = "0.2.4", default-features = false, features = ["iouring", "async-cancel", "sync"] }
 
 [dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["ring"] }
 base64 = "0.22"
 rand = "0.8"
 rustls = "0.23"

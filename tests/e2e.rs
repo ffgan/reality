@@ -14,6 +14,9 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error, SignatureScheme};
 use x25519_dalek::{PublicKey, StaticSecret};
 
+#[path = "support/tls_destination.rs"]
+mod tls_destination;
+
 #[test]
 fn against_xray() {
     let xray = "/tmp/xray-bin";
@@ -21,31 +24,7 @@ fn against_xray() {
         eprintln!("skip: {xray} missing");
         return;
     }
-    let dest = Command::new("go")
-        .args(["build", "-o", "target/tlsdest", "tests/tlsdest.go"])
-        .status()
-        .expect("build tls dest");
-    assert!(dest.success());
-    let mut dest = Command::new("target/tlsdest")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("tls dest");
-    let mut out = String::new();
-    {
-        let stdout = dest.stdout.as_mut().unwrap();
-        let mut byte = [0u8; 1];
-        while stdout.read(&mut byte).unwrap() == 1 {
-            out.push(byte[0] as char);
-            if out.lines().count() >= 3 && out.ends_with('\n') {
-                break;
-            }
-        }
-    }
-    let mut lines = out.lines();
-    let http_addr = lines.next().unwrap().to_string();
-    let tls_addr = lines.next().unwrap().to_string();
-    let raw_tls = lines.next().unwrap().to_string();
+    let [http_addr, tls_addr, raw_tls] = tls_destination::start();
     let echo_addr = serve_echo("127.0.0.1:0");
     let echo6_addr = serve_echo("[::1]:0");
 
@@ -100,7 +79,6 @@ fn against_xray() {
         .expect("xray");
     let server = format!("127.0.0.1:{reality_port}");
     let guard = Guard {
-        dest: &mut dest,
         xray: &mut xray_proc,
     };
     assert!(wait_port(&server), "xray did not listen\n{}", read_log(&log_path));
@@ -455,15 +433,12 @@ fn against_xray() {
 }
 
 struct Guard<'a> {
-    dest: &'a mut Child,
     xray: &'a mut Child,
 }
 
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
-        let _ = self.dest.kill();
         let _ = self.xray.kill();
-        let _ = self.dest.wait();
         let _ = self.xray.wait();
     }
 }

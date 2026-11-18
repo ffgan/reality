@@ -1,7 +1,6 @@
 # reality
 
 Linux VLESS REALITY client with Vision TCP forwarding and standard VLESS UDP.
-The Rust implementation is in `src/`; the Go files are the earlier client.
 
 ## OpenWrt / Passwall
 
