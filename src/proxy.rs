@@ -1,4 +1,4 @@
-//! SOCKS5 and the io_uring splice that takes over once Vision is raw.
+//! SOCKS5 and kernel splice forwarding once Vision is raw.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -114,13 +114,7 @@ pub(crate) fn relay(mut local: TcpStream, remote: Tunnel) -> Result<()> {
         local.set_write_timeout(None)?;
         download.set_read_timeout(None)?;
         download.set_write_timeout(None)?;
-        if let Err(e) = splice_pair(local_fd, remote_fd) {
-            if e.to_string().starts_with("io_uring") {
-                copy_rest(&mut download, &remote)?;
-            } else {
-                return Err(e);
-            }
-        }
+        splice_pair(local_fd, remote_fd)?;
     }
     Ok(())
 }
@@ -145,16 +139,6 @@ fn write_records(remote: &Tunnel, mut data: &[u8]) -> Result<()> {
         remote.write_all_chunks(data)?;
     }
     Ok(())
-}
-
-fn copy_rest(local: &mut TcpStream, remote: &Tunnel) -> Result<()> {
-    let mut buf = [0u8; 32 * 1024];
-    loop {
-        match remote.read_some(&mut buf) {
-            Ok(ReadOut::Data(n)) => local.write_all(&buf[..n])?,
-            _ => return Ok(()),
-        }
-    }
 }
 
 fn is_timeout(err: &std::io::Error) -> bool {
@@ -182,7 +166,6 @@ fn make_pipe() -> Result<Pipe> {
     }
     unsafe {
         libc::fcntl(fds[0], libc::F_SETPIPE_SZ, 1 << 20);
-        libc::fcntl(fds[1], libc::F_SETPIPE_SZ, 1 << 20);
     }
     Ok(Pipe {
         r: fds[0],
@@ -202,7 +185,10 @@ struct Leg {
 }
 
 fn splice_pair(local: RawFd, remote: RawFd) -> Result<()> {
-    let mut ring = IoUring::new(16).map_err(|e| err(format!("io_uring: {e}")))?;
+    splice_pair_with_ring(local, remote, IoUring::new(16).ok())
+}
+
+fn splice_pair_with_ring(local: RawFd, remote: RawFd, ring: Option<IoUring>) -> Result<()> {
     let p0 = make_pipe()?;
     let p1 = make_pipe()?;
     let mut legs = [
@@ -227,6 +213,16 @@ fn splice_pair(local: RawFd, remote: RawFd) -> Result<()> {
             done: false,
         },
     ];
+    let Some(mut ring) = ring else {
+        for fd in [local, remote] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        return splice_with_poll(&mut legs);
+    };
     loop {
         if legs.iter().all(|leg| leg.done) {
             return Ok(());
@@ -241,8 +237,11 @@ fn splice_pair(local: RawFd, remote: RawFd) -> Result<()> {
         if legs.iter().all(|leg| leg.done || !leg.inflight) {
             return Err(err("splice made no progress"));
         }
-        ring.submit_and_wait(1)
-            .map_err(|e| err(format!("io_uring enter: {e}")))?;
+        match ring.submit_and_wait(1) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
         while let Some(cqe) = ring.completion().next() {
             let idx = cqe.user_data() as usize;
             if idx >= legs.len() {
@@ -251,28 +250,82 @@ fn splice_pair(local: RawFd, remote: RawFd) -> Result<()> {
             let res = cqe.result();
             let leg = &mut legs[idx];
             leg.inflight = false;
-            if leg.phase == 0 {
-                if res > 0 {
-                    leg.remain = res as u32;
-                    leg.phase = 1;
-                } else if res == 0 || res == -libc::EPIPE || res == -libc::ECONNRESET {
-                    finish_leg(leg);
-                } else if res != -libc::EAGAIN && res != -libc::EINTR {
-                    return Err(err(format!("splice in: {res}")));
-                }
-            } else if res > 0 {
-                SPLICED.fetch_add(res as u64, Ordering::Relaxed);
-                leg.remain = leg.remain.saturating_sub(res as u32);
-                if leg.remain == 0 {
-                    leg.phase = 0;
-                }
-            } else if res == 0 || res == -libc::EPIPE || res == -libc::ECONNRESET {
-                finish_leg(leg);
-            } else if res != -libc::EAGAIN && res != -libc::EINTR {
-                return Err(err(format!("splice out: {res}")));
+            if res != -libc::EAGAIN && res != -libc::EINTR {
+                complete_splice(leg, res)?;
             }
         }
     }
+}
+
+fn complete_splice(leg: &mut Leg, result: i32) -> Result<()> {
+    match result {
+        0 => finish_leg(leg),
+        n if n == -libc::EPIPE || n == -libc::ECONNRESET => finish_leg(leg),
+        n if n < 0 => return Err(std::io::Error::from_raw_os_error(-n).into()),
+        n if leg.phase == 0 => {
+            leg.remain = n as u32;
+            leg.phase = 1;
+        }
+        n => {
+            SPLICED.fetch_add(n as u64, Ordering::Relaxed);
+            leg.remain -= n as u32;
+            if leg.remain == 0 {
+                leg.phase = 0;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn splice_with_poll(legs: &mut [Leg; 2]) -> Result<()> {
+    while legs.iter().any(|leg| !leg.done) {
+        let mut fds = legs.each_ref().map(|leg| {
+            let (fd, events) = if leg.phase == 0 {
+                (leg.sock_in, libc::POLLIN)
+            } else {
+                (leg.sock_out, libc::POLLOUT)
+            };
+            libc::pollfd {
+                fd: if leg.done { -1 } else { fd },
+                events,
+                revents: 0,
+            }
+        });
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        for (leg, fd) in legs.iter_mut().zip(fds) {
+            if fd.revents == 0 {
+                continue;
+            }
+            let (input, output, len) = leg.transfer();
+            let result = unsafe {
+                libc::splice(
+                    input,
+                    std::ptr::null_mut(),
+                    output,
+                    std::ptr::null_mut(),
+                    len as usize,
+                    libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+                )
+            };
+            let result = if result < 0 {
+                -std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO)
+            } else {
+                result as i32
+            };
+            if result != -libc::EAGAIN && result != -libc::EINTR {
+                complete_splice(leg, result)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn finish_leg(leg: &mut Leg) {
@@ -280,14 +333,20 @@ fn finish_leg(leg: &mut Leg) {
     unsafe { libc::shutdown(leg.sock_out, libc::SHUT_WR) };
 }
 
+impl Leg {
+    fn transfer(&self) -> (RawFd, RawFd, u32) {
+        if self.phase == 0 {
+            (self.sock_in, self.pipe_w, 256 * 1024)
+        } else {
+            (self.pipe_r, self.sock_out, self.remain)
+        }
+    }
+}
+
 fn submit(ring: &mut IoUring, leg: &Leg, user: u64) -> Result<()> {
-    let (fd_in, fd_out, len) = if leg.phase == 0 {
-        (leg.sock_in, leg.pipe_w, 256 * 1024)
-    } else {
-        (leg.pipe_r, leg.sock_out, leg.remain.max(1))
-    };
+    let (fd_in, fd_out, len) = leg.transfer();
     let op = opcode::Splice::new(types::Fd(fd_in), -1, types::Fd(fd_out), -1, len)
-        .flags(1)
+        .flags(libc::SPLICE_F_MOVE)
         .build()
         .user_data(user);
     unsafe {
@@ -339,4 +398,37 @@ fn socks5(conn: &mut TcpStream) -> Result<(String, u16)> {
     conn.set_read_timeout(None)?;
     conn.set_write_timeout(None)?;
     Ok((host, u16::from_be_bytes(portb)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Shutdown;
+
+    #[test]
+    fn poll_splice_relays_both_directions_and_half_closes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let first = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (local, _) = listener.accept().unwrap();
+        let second = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (remote, _) = listener.accept().unwrap();
+        thread::scope(|scope| {
+            let relay = scope
+                .spawn(move || splice_pair_with_ring(local.as_raw_fd(), remote.as_raw_fd(), None));
+            for (mut peer, sent, expected) in [(first, 0xA1, 0xB2), (second, 0xB2, 0xA1)] {
+                scope.spawn(move || {
+                    let timeout = Some(Duration::from_secs(10));
+                    peer.set_read_timeout(timeout).unwrap();
+                    peer.set_write_timeout(timeout).unwrap();
+                    peer.write_all(&vec![sent; 512 * 1024]).unwrap();
+                    peer.shutdown(Shutdown::Write).unwrap();
+                    let mut received = Vec::new();
+                    peer.read_to_end(&mut received).unwrap();
+                    assert_eq!(received.len(), 512 * 1024);
+                    assert!(received.iter().all(|&byte| byte == expected));
+                });
+            }
+            relay.join().unwrap().unwrap();
+        });
+    }
 }

@@ -42,6 +42,17 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=ld.lld \
   cargo build --release --target aarch64-unknown-linux-musl --bin reality
 ```
 
+For the Cortex-A53 OpenWrt router, build with the ARMv8 AES and PMULL backends enabled:
+
+```sh
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=ld.lld \
+  RUSTFLAGS='-C linker-flavor=ld -C target-cpu=cortex-a53 --cfg aes_armv8 --cfg polyval_armv8' \
+  cargo build --locked --release --target aarch64-unknown-linux-musl --bin reality
+```
+
+After Vision switches to raw TCP, both relay directions use Linux splice.
+When io_uring setup fails, the relay uses poll and nonblocking splice.
+
 Example private configuration (`chmod 600 /path/to/config.json`):
 
 ```json

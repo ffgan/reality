@@ -3,7 +3,7 @@
 //! The handshake matches Xray 26.11.9: the ClientHello carries an
 //! X25519MLKEM768 share, and the session id is an AES-256-GCM seal of the
 //! version, time, and short id. After Vision switches both directions to raw
-//! inner bytes, the proxy splices the two sockets through io_uring.
+//! inner bytes, the proxy relays the two sockets using Linux splice.
 
 mod proxy;
 mod tls;
@@ -149,7 +149,7 @@ fn hex_val(b: u8) -> Result<u8> {
     }
 }
 
-/// Bytes moved by io_uring splice since process start.
+/// Bytes moved by kernel splice since process start.
 pub fn spliced_bytes() -> u64 {
     proxy::spliced_bytes()
 }
