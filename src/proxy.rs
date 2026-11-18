@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use io_uring::{opcode, types, IoUring};
 
@@ -28,16 +29,50 @@ pub struct Endpoint {
 
 pub fn serve_listener(ln: TcpListener, endpoint: Endpoint) -> Result<()> {
     let endpoint = Arc::new(endpoint);
-    for conn in ln.incoming() {
-        let conn = conn?;
+    loop {
+        let conn = accept_tcp(&ln)?;
         let endpoint = endpoint.clone();
-        thread::spawn(move || {
-            if let Err(e) = handle(conn, &endpoint) {
-                eprintln!("reality: {e}");
-            }
-        });
+        if let Err(error) = thread::Builder::new()
+            .name("socks-client".into())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                if let Err(e) = handle(conn, &endpoint) {
+                    eprintln!("reality: {e}");
+                }
+            })
+        {
+            eprintln!("reality worker unavailable: {error}");
+        }
     }
-    Ok(())
+}
+
+// An exhausted descriptor table is temporary, not a reason to terminate every
+// existing relay. Back off until active clients release their descriptors.
+pub(crate) fn accept_tcp(listener: &TcpListener) -> std::io::Result<TcpStream> {
+    let mut last_warning: Option<Instant> = None;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return Ok(stream),
+            Err(error)
+                if matches!(error.raw_os_error(), Some(libc::EINTR | libc::ECONNABORTED)) =>
+            {
+                continue
+            }
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+                ) =>
+            {
+                if last_warning.is_none_or(|last| last.elapsed() >= Duration::from_secs(10)) {
+                    eprintln!("reality accept temporarily unavailable: {error}");
+                    last_warning = Some(Instant::now());
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn handle(mut local: TcpStream, endpoint: &Endpoint) -> Result<()> {
@@ -51,7 +86,7 @@ fn handle(mut local: TcpStream, endpoint: &Endpoint) -> Result<()> {
         }
     };
     local.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])?;
-    relay(local, remote)
+    relay(local, remote).map_err(|e| err(format!("relay {host}:{port}: {e}")))
 }
 
 pub(crate) fn relay(mut local: TcpStream, remote: Tunnel) -> Result<()> {
@@ -61,23 +96,30 @@ pub(crate) fn relay(mut local: TcpStream, remote: Tunnel) -> Result<()> {
     let remote_fd = remote.raw_fd();
     let splice = thread::scope(|scope| -> Result<bool> {
         let upload = scope.spawn(|| -> Result<bool> {
-            let mut buf = [0u8; 32 * 1024];
-            loop {
-                if remote.ready_to_splice() {
-                    return Ok(true);
-                }
-                match local.read(&mut buf) {
-                    Ok(0) => {
-                        if !remote.ready_to_splice() {
-                            let _ = remote.shutdown_write();
-                        }
-                        return Ok(false);
+            let result = (|| -> Result<bool> {
+                let mut buf = [0u8; 32 * 1024];
+                loop {
+                    if remote.ready_to_splice() {
+                        return Ok(true);
                     }
-                    Ok(n) => write_records(&remote, &buf[..n])?,
-                    Err(e) if is_timeout(&e) => continue,
-                    Err(e) => return Err(e.into()),
+                    match local.read(&mut buf) {
+                        Ok(0) => {
+                            if !remote.ready_to_splice() {
+                                let _ = remote.shutdown_write();
+                            }
+                            return Ok(false);
+                        }
+                        Ok(n) => write_records(&remote, &buf[..n])?,
+                        Err(e) if is_timeout(&e) => continue,
+                        Err(e) => return Err(e.into()),
+                    }
                 }
+            })();
+            if result.is_err() {
+                remote.shutdown();
+                let _ = local.shutdown(std::net::Shutdown::Both);
             }
+            result
         });
         let mut buf = [0u8; 32 * 1024];
         let mut down = false;
@@ -87,7 +129,14 @@ pub(crate) fn relay(mut local: TcpStream, remote: Tunnel) -> Result<()> {
                 break;
             }
             match remote.read_some(&mut buf) {
-                Ok(ReadOut::Data(n)) => download.write_all(&buf[..n])?,
+                Ok(ReadOut::Data(n)) => {
+                    if let Err(e) = download.write_all(&buf[..n]) {
+                        remote.shutdown();
+                        let _ = download.shutdown(std::net::Shutdown::Both);
+                        let _ = upload.join();
+                        return Err(e.into());
+                    }
+                }
                 Ok(ReadOut::Eof) => {
                     // The client is blocked in read_to_end until this write
                     // side closes. Shut it down before joining upload.
@@ -99,6 +148,7 @@ pub(crate) fn relay(mut local: TcpStream, remote: Tunnel) -> Result<()> {
                     break;
                 }
                 Err(e) => {
+                    remote.shutdown();
                     let _ = download.shutdown(std::net::Shutdown::Both);
                     let _ = upload.join();
                     return Err(e);
@@ -162,7 +212,7 @@ impl Drop for Pipe {
 fn make_pipe() -> Result<Pipe> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(err("pipe"));
+        return Err(std::io::Error::last_os_error().into());
     }
     unsafe {
         libc::fcntl(fds[0], libc::F_SETPIPE_SZ, 1 << 20);

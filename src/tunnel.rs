@@ -21,6 +21,8 @@ const TLS13_VERSIONS: &[u8] = &[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
 const FLOW: &str = "xtls-rprx-vision";
 
 pub struct Tunnel {
+    sending: Mutex<()>,
+    shutdown_fd: std::os::fd::RawFd,
     read: Mutex<TcpStream>,
     write: Mutex<TcpStream>,
     read_keys: Mutex<Traffic>,
@@ -103,7 +105,11 @@ impl Tunnel {
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(None)?;
         let write = stream.try_clone()?;
+        use std::os::fd::AsRawFd;
+        let shutdown_fd = write.as_raw_fd();
         Ok(Self {
+            sending: Mutex::new(()),
+            shutdown_fd,
             read: Mutex::new(stream),
             write: Mutex::new(write),
             read_keys: Mutex::new(session.read),
@@ -220,11 +226,11 @@ impl Tunnel {
     }
 
     pub fn shutdown(&self) {
-        let _ = self
-            .write
-            .lock()
-            .expect("write")
-            .shutdown(std::net::Shutdown::Both);
+        // The descriptor remains owned by self. Do not wait for a writer
+        // mutex: shutdown must interrupt a blocked writer/reader as well.
+        unsafe {
+            libc::shutdown(self.shutdown_fd, libc::SHUT_RDWR);
+        }
     }
 
     pub fn raw_fd(&self) -> std::os::fd::RawFd {
@@ -233,6 +239,7 @@ impl Tunnel {
     }
 
     fn write_chunk(&self, data: &[u8]) -> Result<()> {
+        let _sending = self.sending.lock().expect("sending");
         let (packet, raw) = {
             let mut st = self.state.lock().expect("state");
             let raw = if st.direct_armed {
@@ -271,25 +278,31 @@ impl Tunnel {
     }
 
     fn ensure_response(&self) -> Result<()> {
-        let packet = {
-            let mut st = self.state.lock().expect("state");
-            if st.header_sent && st.response_done {
-                return Ok(());
+        if !self.state.lock().expect("state").header_sent {
+            // Serialize state preparation with the actual write. Otherwise the
+            // upload thread can see header_sent and send body bytes before this
+            // reader has written the VLESS request header to the wire.
+            let _sending = self.sending.lock().expect("sending");
+            let packet = {
+                let mut st = self.state.lock().expect("state");
+                if st.header_sent && st.response_done {
+                    return Ok(());
+                }
+                if st.header_sent {
+                    None
+                } else {
+                    let frame = st.pad(&[]);
+                    st.header_sent = true;
+                    let mut p = st.request.clone();
+                    p.extend_from_slice(&frame);
+                    Some(p)
+                }
+            };
+            if let Some(packet) = packet {
+                let mut keys = self.write_keys.lock().expect("keys");
+                let mut w = self.write.lock().expect("write");
+                tls::write_app(&mut w, &mut keys, &packet)?;
             }
-            if st.header_sent {
-                None
-            } else {
-                let frame = st.pad(&[]);
-                st.header_sent = true;
-                let mut p = st.request.clone();
-                p.extend_from_slice(&frame);
-                Some(p)
-            }
-        };
-        if let Some(packet) = packet {
-            let mut keys = self.write_keys.lock().expect("keys");
-            let mut w = self.write.lock().expect("write");
-            tls::write_app(&mut w, &mut keys, &packet)?;
         }
         while !self.state.lock().expect("state").response_done {
             let mut keys = self.read_keys.lock().expect("keys");

@@ -87,25 +87,23 @@ pub fn serve_transparent(port: u16, tproxy: bool, endpoint: Endpoint) -> Result<
         let endpoint = endpoint.clone();
         thread::Builder::new()
             .name("redirect-tcp".into())
-            .spawn(move || {
-                for conn in listener.incoming() {
-                    match conn {
-                        Ok(conn) => {
-                            let endpoint = endpoint.clone();
-                            if let Err(e) = thread::Builder::new()
-                                .name("transparent-tcp".into())
-                                .stack_size(256 * 1024)
-                                .spawn(move || {
-                                    if let Err(e) = tcp(conn, tproxy, &endpoint) {
-                                        eprintln!("reality transparent TCP: {e}");
-                                    }
-                                })
-                            {
-                                eprintln!("reality TCP worker: {e}");
-                            }
+            .spawn(move || loop {
+                match proxy::accept_tcp(&listener) {
+                    Ok(conn) => {
+                        let endpoint = endpoint.clone();
+                        if let Err(e) = thread::Builder::new()
+                            .name("transparent-tcp".into())
+                            .stack_size(256 * 1024)
+                            .spawn(move || {
+                                if let Err(e) = tcp(conn, tproxy, &endpoint) {
+                                    eprintln!("reality transparent TCP: {e}");
+                                }
+                            })
+                        {
+                            eprintln!("reality TCP worker: {e}");
                         }
-                        Err(e) => eprintln!("reality accept: {e}"),
                     }
+                    Err(e) => eprintln!("reality accept: {e}"),
                 }
             })?;
     }

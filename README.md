@@ -97,3 +97,17 @@ reality-udp-probe --stun
 The first probe checks repeated UDP DNS replies through REALITY; the second
 sends ordinary UDP through the router's firewall and reports the STUN-mapped
 exit IP, so transparent UDP can be distinguished from a direct connection.
+
+### Resource and failure recovery
+
+SOCKS and transparent listeners back off on temporary descriptor or buffer
+exhaustion and resume accepting when capacity returns. Worker creation failure
+does not terminate the listener. Request-header preparation and transmission
+share a send lock, so the initial response reader cannot reorder the VLESS
+header with an upload thread. Relay errors shut down both sockets before
+joining the other direction, releasing blocked workers.
+
+Run `python3 tests/resource_recovery.py target/debug/reality` to verify that a
+64-descriptor child survives a 96-client burst and accepts SOCKS requests again.
+The Passwall supervisor sets a 4096-descriptor budget and sends native-core
+diagnostics to OpenWrt logd so node changes do not delete failure evidence.
