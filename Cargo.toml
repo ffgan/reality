@@ -1,0 +1,38 @@
+[package]
+name = "reality"
+version = "0.1.0"
+edition = "2021"
+autoexamples = false
+default-run = "reality"
+description = "VLESS REALITY client aligned with Xray 26.11.9, with io_uring splice"
+license = "MIT"
+
+[dependencies]
+aes-gcm = "0.10"
+base64 = "0.22"
+ed25519-dalek = "2"
+getrandom = "0.2"
+hmac = "0.12"
+io-uring = "0.7"
+libc = "0.2"
+ml-kem = "0.2.2"
+rand = "0.8"
+sha2 = "0.10"
+serde_json = "1"
+socket2 = { version = "0.6", features = ["all"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+x509-parser = "0.16"
+
+[dev-dependencies]
+base64 = "0.22"
+rand = "0.8"
+rustls = "0.23"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[features]
+device-test = []
+
+[[bin]]
+name = "reality-udp-probe"
+path = "examples/udp_probe.rs"
+required-features = ["device-test"]
