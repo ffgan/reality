@@ -37,6 +37,10 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 device-test = []
 
 [[bin]]
+name = "socks-chain"
+path = "src/bin/socks_chain.rs"
+
+[[bin]]
 name = "reality-udp-probe"
 path = "examples/udp_probe.rs"
 required-features = ["device-test"]
